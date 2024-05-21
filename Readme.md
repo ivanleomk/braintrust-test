@@ -38,3 +38,7 @@ Follow these steps to set up and run the script:
    ```
 
 Make sure to replace `your_api_key_here` with your actual Braintrust API key.
+
+![Sample Braintrust Query](sample-braintrust-query.png)
+
+In the screenshot above, we demonstrate how arbitrary metadata can be added to a specific row when running experiments. This allows for filtering within the data itself, making it easier to manage and analyze the results of your experiments.

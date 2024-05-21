@@ -103,7 +103,6 @@ def insert_data_into_table_if_empty(data: list[dict], table: lancedb.table.Table
 
     print("Table is empty. Inserting data...")
     for passage_batch in tqdm(batched(data, 20)):
-        print(f"Inserting batch of size {len(passage_batch)} into the table.")
         table.add(list(passage_batch))
     print("Data insertion complete.")
 
