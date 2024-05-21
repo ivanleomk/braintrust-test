@@ -3,14 +3,14 @@ from lancedb.pydantic import LanceModel, Vector
 from lancedb.embeddings import get_registry
 from datasets import load_dataset
 from tqdm.asyncio import tqdm_asyncio as asyncio
-from braintrust import Eval
+import random
 from tqdm import tqdm
 import instructor
 import openai
 from pydantic import BaseModel, Field
 from asyncio import run
 from itertools import product, batched
-
+import braintrust
 import hashlib
 
 
@@ -131,49 +131,57 @@ async def generate_question_batch(text_chunk_batch):
     return [{"input": item[0].question, "expected": item[1]} for item in res]
 
 
-def retrieve_k_relevant_chunk(search_type: str):
-    def inner(input: str):
-        db = lancedb.connect("./db")
-        table = db.open_table("chunk")
-        return [
-            item["chunk_id"]
-            for item in table.search(input, query_type=search_type)
-            .limit(max(SIZES))
-            .to_list()
-        ]
-
-    return inner
-
-
-def score(question, chunk_id, output):
-    from braintrust import Score
-
+def retrieve_k_relevant_chunk(input: str, search_type: str):
+    db = lancedb.connect("./db")
+    table = db.open_table("chunk")
     return [
-        Score(
-            name=f"{fn_name}@{size}",
-            score=eval_functions[fn_name](chunk_id, output[:size]),
-        )
-        for size, fn_name in product(SIZES, eval_functions.keys())
+        item["chunk_id"]
+        for item in table.search(input, query_type=search_type)
+        .limit(max(SIZES))
+        .to_list()
     ]
 
 
+def score(chunk_id, output):
+    return {
+        f"{fn_name}@{size}": eval_functions[fn_name](chunk_id, output[:size])
+        for size, fn_name in product(SIZES, eval_functions.keys())
+    }
+
+
 if __name__ == "__main__":
+    experiment = braintrust.init(project="MS-Marco-Test-Manual")
     db = create_db_if_not_exists()
     table = create_table_if_not_exists(db)
 
     data, labels = get_data_and_selected_passages_from_dataset()
     insert_data_into_table_if_empty(data, table)
 
-    table.create_fts_index("text")
+    table.create_fts_index("text", replace=True)
 
     eval_data = run(generate_question_batch(labels[:10]))
 
     for search_type in ["fts", "hybrid"]:
-        Eval(
-            "MS-Marco Test",
-            data=eval_data,
-            task=retrieve_k_relevant_chunk(search_type),
-            scores=[score],
-            experiment_name="Experiment abc",
-            metadata={"search_type": search_type},
-        )
+        for data in eval_data:
+            retrieved_chunks = retrieve_k_relevant_chunk(data["input"], search_type)
+            experiment.log(
+                input=data["input"],
+                output=retrieved_chunks,
+                expected=data["expected"],
+                scores=score(data["expected"], retrieved_chunks),
+                metadata={
+                    "search_type": search_type,
+                    "category": random.choice(
+                        [
+                            "business",
+                            "entertainment",
+                            "health",
+                            "science",
+                            "sports",
+                            "technology",
+                        ]
+                    ),
+                },
+            )
+
+    experiment.summarize(summarize_scores=True)
