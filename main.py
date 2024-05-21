@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from asyncio import run
 from itertools import product, batched
 
+import hashlib
+
 
 client = instructor.from_openai(openai.AsyncOpenAI())
 
@@ -43,14 +45,18 @@ class QuestionAnswerPair(BaseModel):
     answer: str = Field(..., description="The answer to the generated question.")
 
 
-def setup_table():
-    import os
+def create_db_if_not_exists() -> lancedb.DBConnection:
+    return lancedb.connect("./db")
 
-    if os.path.exists("./db"):
-        db = lancedb.connect("./db")
+
+def create_table_if_not_exists(db: lancedb.DBConnection) -> lancedb.table.Table:
+    current_tables = db.table_names()
+    print(f"Current tables in the database: {current_tables}")
+    if "chunk" in current_tables:
+        print("Table 'chunk' already exists. Opening the existing table.")
         return db.open_table("chunk")
 
-    # Connect to the LanceDB database
+    print("Table 'chunk' does not exist. Creating a new table.")
     db = lancedb.connect("./db")
     func = get_registry().get("openai").create(name="text-embedding-3-small", dim=256)
 
@@ -59,48 +65,47 @@ def setup_table():
         text: str = func.SourceField()
         vector: Vector(func.ndims()) = func.VectorField()
 
-    table = db.create_table("chunk", schema=TextChunk, mode="overwrite")
-    load_data(table)
+    print("Creating table 'chunk' with schema TextChunk.")
+    return db.create_table("chunk", schema=TextChunk, mode="overwrite")
 
 
-def load_data(table):
-    fw = load_dataset(
-        "HuggingFaceFW/fineweb", name="CC-MAIN-2024-10", split="train", streaming=True
-    ).take(100)
+def get_data_and_selected_passages_from_dataset():
+    dataset = load_dataset("ms_marco", "v1.1", split="train", streaming=True).take(100)
 
-    row_data = []
-    for row in tqdm(fw):
-        text = row["text"][:2000]  # Truncate if longer than 2000 chars
-        chunk_id = row["id"]
-        row_data.append({"text": text, "chunk_id": chunk_id})
+    passages = set()
+    data = []
+    labels = []
+    for row in tqdm(dataset):
+        selected_passages = []
+        for idx, passage in enumerate(row["passages"]["passage_text"]):
+            if passage not in passages:
+                chunk_id = hashlib.md5(passage.encode()).hexdigest()
+                passage_data_obj = {"text": passage, "chunk_id": chunk_id}
+                data.append(passage_data_obj)
+                passages.add(passage)
 
-    batches = batched(row_data, 20)
+                if row["passages"]["is_selected"][idx]:
+                    selected_passages.append(passage_data_obj)
 
-    for batch in batches:
-        table.add(list(batch))
+        labels.extend(selected_passages)
 
-    table.create_fts_index("text", replace=True)
+    return data, labels
 
 
-def fetch_all_chunks_from_db(max_chunk=None):
-    # Connect to the LanceDB database
-    db = lancedb.connect("./db")
+def insert_data_into_table_if_empty(data: list[dict], table: lancedb.table.Table):
+    """
+    If the table has existing data, then we don't insert any data into the table
+    """
+    print("Checking if the table has existing data...")
+    if table.count_rows() > 0:
+        print("Table already has data. No insertion needed.")
+        return
 
-    # Open the table
-    table = db.open_table("chunk")
-
-    # Fetch all records from the table
-    all_records = table.to_pandas()
-
-    chunks = [
-        [item["chunk_id"], item["text"]]
-        for item in all_records[["chunk_id", "text"]].to_dict(orient="records")
-    ]
-
-    if max_chunk is not None:
-        chunks = chunks[:max_chunk]
-
-    return chunks
+    print("Table is empty. Inserting data...")
+    for passage_batch in tqdm(batched(data, 20)):
+        print(f"Inserting batch of size {len(passage_batch)} into the table.")
+        table.add(list(passage_batch))
+    print("Data insertion complete.")
 
 
 async def generate_question_batch(text_chunk_batch):
@@ -119,17 +124,25 @@ async def generate_question_batch(text_chunk_batch):
         )
         return (question, chunk_id)
 
-    coros = [generate_question(text, chunk_id) for chunk_id, text in text_chunk_batch]
+    coros = [
+        generate_question(item["text"], item["chunk_id"]) for item in text_chunk_batch
+    ]
     res = await asyncio.gather(*coros)
     return [{"input": item[0].question, "expected": item[1]} for item in res]
 
 
-def retrieve_k_relevant_chunk(input: str):
-    db = lancedb.connect("./db")
-    table = db.open_table("chunk")
-    return [
-        item["chunk_id"] for item in table.search(input).limit(max(SIZES)).to_list()
-    ]
+def retrieve_k_relevant_chunk(search_type: str):
+    def inner(input: str):
+        db = lancedb.connect("./db")
+        table = db.open_table("chunk")
+        return [
+            item["chunk_id"]
+            for item in table.search(input, query_type=search_type)
+            .limit(max(SIZES))
+            .to_list()
+        ]
+
+    return inner
 
 
 def score(question, chunk_id, output):
@@ -145,13 +158,22 @@ def score(question, chunk_id, output):
 
 
 if __name__ == "__main__":
-    setup_table()
-    text_chunks = fetch_all_chunks_from_db(20)
-    eval_data = run(generate_question_batch(text_chunks))
-    Eval(
-        "Query Test",
-        data=eval_data,
-        task=retrieve_k_relevant_chunk,
-        scores=[score],
-        # trial_count=3,
-    )
+    db = create_db_if_not_exists()
+    table = create_table_if_not_exists(db)
+
+    data, labels = get_data_and_selected_passages_from_dataset()
+    insert_data_into_table_if_empty(data, table)
+
+    table.create_fts_index("text")
+
+    eval_data = run(generate_question_batch(labels[:10]))
+
+    for search_type in ["fts", "hybrid"]:
+        Eval(
+            "MS-Marco Test",
+            data=eval_data,
+            task=retrieve_k_relevant_chunk(search_type),
+            scores=[score],
+            experiment_name="Experiment abc",
+            metadata={"search_type": search_type},
+        )
